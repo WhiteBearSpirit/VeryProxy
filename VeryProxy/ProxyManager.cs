@@ -1,4 +1,5 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Text.RegularExpressions;
@@ -9,36 +10,34 @@ namespace VeryProxy
 {
     public class ProxyManager
     {
-        //Todo: if 20 failures in a row then 'network/target_site failure', don't mark proxies as bad until first good report
         object listLock = new object();
         object saveToFileLock = new object();
 
         List<string> proxyStrings = new List<string>();
         int listCounter = 0;
 
-        const string pp = "proxy.txt";
+        public const string AddressPortPlusRegEx = @"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?):\d{1,5}[\+-]{0,10}";
+
+        const string pp = "proxyList.txt";
         const int criticalProxCount = 5;
         const int saveEvery = 10;
         const int maxFailures = 5;
 
-        public ProxyManager(string proxyFilePath = pp)
+        public ProxyManager(IEnumerable<string> proxyList)
         {
-            ReadProxyListFromFile();
+            if (proxyList.Count() == 0) { throw new OutOfProxyException(); }
+            AddProxyRangeToList(proxyList);
         }
 
-        public void ReadProxyListFromFile(string path = pp)
-        {
-            //uses lock (listLock) inside
-            AddProxyRangeToList(File.ReadAllLines(path));
-        }
+
         void AddProxyRangeToList(IEnumerable<string> listInput)
         {
             lock (listLock)
             {
                 foreach (string prox in listInput)
                 {
-                    string matchedProx = Regex.Match(prox, Utils.AddressPortPlusRegEx).Value;
-                    if (matchedProx != null)
+                    string matchedProx = Regex.Match(prox, AddressPortPlusRegEx).Value;
+                    if (!string.IsNullOrWhiteSpace(matchedProx))
                     {
                         proxyStrings.Add(matchedProx);
                     }
@@ -103,7 +102,7 @@ namespace VeryProxy
         }
         public void Report(string proxyString, bool good)
         {
-            if (proxyString == null) { return; }
+            if (string.IsNullOrWhiteSpace(proxyString)) { return; }
             lock (listLock)
             {
                 int index = proxyStrings.FindIndex(s => s.Contains(proxyString));
@@ -124,18 +123,20 @@ namespace VeryProxy
                 }
                 else
                 {
-                    Log.SameLine(good ? "+" : "-");
                     if ((minusCount + plusCount) > (maxFailures * 2))
                     {
                         proxyStrings[index] = modString.TrimEnd('+', '-') + (good ? '+' : '-');
                     }
                     else { proxyStrings[index] = modString; }
                 }
-
             }
         }
 
 
     }
-
+    public class OutOfProxyException : Exception
+    {
+        public OutOfProxyException() { }
+        public OutOfProxyException(string message) : base(message) { }
+    }
 }

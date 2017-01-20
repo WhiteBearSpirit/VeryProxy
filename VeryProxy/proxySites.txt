@@ -1,0 +1,7 @@
+http://free-proxy-list.net/
+http://proxydb.net/?protocol=http&anonlvl=1&offset=0
+https://www.proxynova.com/proxy-server-list/country-de/
+https://www.proxynova.com/proxy-server-list/country-cn/
+https://www.proxynova.com/proxy-server-list/country-fr/
+https://www.proxynova.com/proxy-server-list/country-hk/
+http://gatherproxy.com/
