@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -12,21 +13,45 @@ namespace VeryProxy
     {
         object listLock = new object();
         object saveToFileLock = new object();
+        object getNewProxiesLock = new object();
 
-        List<string> proxyStrings = new List<string>();
+        string proxySitesFile = "proxySites.txt";
+        string proxyListFile = "proxyList.txt";
+
+        List<string> proxyList = new List<string>();
+        string[] proxySites;
         int listCounter = 0;
+        int sitesCounter = 0;
+        int failuresInARow = 0;
+        
+        const int Timeout = 10000;
+        const int minProxCount = 250;
+        const int criticalProxCount = 100;
+        const int maxFailuresInARow = 150;
+        const int saveEvery = 100;
+        const int reportMaxFailures = 10;
+        const string AddressPortPlusRegEx = @"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?):\d{1,5}[\+-]{0,10}";
 
-        public const string AddressPortPlusRegEx = @"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?):\d{1,5}[\+-]{0,10}";
 
-        const string pp = "proxyList.txt";
-        const int criticalProxCount = 5;
-        const int saveEvery = 10;
-        const int maxFailures = 5;
-
-        public ProxyManager(IEnumerable<string> proxyList)
+        public ProxyManager(string proxyLinksFile)
         {
-            if (proxyList.Count() == 0) { throw new OutOfProxyException(); }
-            AddProxyRangeToList(proxyList);
+            proxySitesFile = proxyLinksFile;
+            ReadProxySitesFromFile();
+            ReadProxyListFromFile();
+            if (proxyList.Count < criticalProxCount) { GetNewProxies(); }
+            if (proxyList.Count < minProxCount) { Task.Run(() => GetNewProxies()); }
+        }
+
+        void ReadProxySitesFromFile()
+        {
+            if (!File.Exists(proxySitesFile)) { throw new InvalidOperationException($"proxySitesFile {proxySitesFile} not found!"); }
+            proxySites = File.ReadAllLines(proxySitesFile).Where(s => !string.IsNullOrWhiteSpace(s)).ToArray();
+        }
+
+        void ReadProxyListFromFile()
+        {
+            if (!File.Exists(proxyListFile)) { return; }
+            AddProxyRangeToList(File.ReadAllLines(proxyListFile));
         }
 
 
@@ -39,7 +64,7 @@ namespace VeryProxy
                     string matchedProx = Regex.Match(prox, AddressPortPlusRegEx).Value;
                     if (!string.IsNullOrWhiteSpace(matchedProx))
                     {
-                        proxyStrings.Add(matchedProx);
+                        proxyList.Add(matchedProx);
                     }
                 }
                 RemoveDuplicates();
@@ -49,7 +74,7 @@ namespace VeryProxy
         {
             List<string> processedList = new List<string>();
             List<string> currentProxiesTrimmed = new List<string>();
-            foreach (string prox in proxyStrings)
+            foreach (string prox in proxyList)
             {
                 string trimmedProx = prox.TrimEnd('+', '-', ' ');
                 if (!currentProxiesTrimmed.Contains(trimmedProx))
@@ -58,10 +83,10 @@ namespace VeryProxy
                     processedList.Add(prox);
                 }
             }
-            proxyStrings = processedList;
+            proxyList = processedList;
         }
 
-        public void SaveProxyListToFile(string path = pp)
+        public void SaveProxyListToFile()
         {
             if (Monitor.TryEnter(saveToFileLock))
             {
@@ -69,7 +94,8 @@ namespace VeryProxy
                 {
                     lock (listLock)
                     {
-                        File.WriteAllLines(path, proxyStrings);
+                        File.WriteAllLines(proxyListFile, proxyList);
+                        Log.SameLine(".");
                     }
                 }
                 finally
@@ -79,61 +105,217 @@ namespace VeryProxy
             }
         }
 
-        public string GiveNewProxyString()
+        public string GiveMeProxyString()
         {
             lock (listLock)
             {
-                if (proxyStrings.Count == 0)
-                {
-                    throw new OutOfProxyException();
-                }
-                if (listCounter >= proxyStrings.Count)
-                {
-                    listCounter = 0;
-                }
-                string proxyString = proxyStrings[listCounter].TrimEnd('+', '-', ' ');
+                int count = proxyList.Count;
+                if (count < criticalProxCount) { Log.SameLine("[p.crit!]"); }
+                if (listCounter >= count) { listCounter = 0; }
+                string proxyString = proxyList[listCounter].TrimEnd('+', '-', ' ');
                 listCounter++;
-                if (listCounter % saveEvery == 0)
-                {
-                    Task.Run(() => SaveProxyListToFile());
-                }
+                if (listCounter % saveEvery == 0) { Task.Run(() => SaveProxyListToFile()); }
                 return proxyString;
             }
         }
-        public void Report(string proxyString, bool good)
+        public void Report(string proxyString, int mark)
         {
-            if (string.IsNullOrWhiteSpace(proxyString)) { return; }
+            if (proxyString == null || mark == 0) { return; }
             lock (listLock)
             {
-                int index = proxyStrings.FindIndex(s => s.Contains(proxyString));
+                bool good = (mark > 0);
+                failuresInARow = good ? 0 : failuresInARow + 1;
+                if (failuresInARow >= maxFailuresInARow)
+                {
+                    Log.SameLine("F");
+                    return;
+                }
+                int index = proxyList.FindIndex(s => s.TrimEnd('+', '-', ' ') == proxyString);
                 if (index == -1)
                 {
                     return;
                 }
-                string origString = proxyStrings[index];
-                string modString = origString + (good ? '+' : '-');
+                string origString = proxyList[index];
+                string postfix = "";
+                for (int i = 0; i < Math.Abs(mark); i++)
+                {
+                    postfix = postfix + (good ? '+' : '-');
+                }
+                string modString = origString + postfix;
                 int minusCount = modString.Count(s => s == '-');
                 int plusCount = modString.Count(s => s == '+');
-                if ((minusCount - plusCount) > maxFailures &&
-                    proxyStrings.Count > criticalProxCount)
+                if ((minusCount - plusCount) > reportMaxFailures &&
+                    proxyList.Count > criticalProxCount)
                 {
                     Log.SameLine("X");
-                    proxyStrings.RemoveAt(index);
-                    Task.Run(() => SaveProxyListToFile());
+                    proxyList.RemoveAt(index);
+                    SaveProxyListToFile();
                 }
                 else
                 {
-                    if ((minusCount + plusCount) > (maxFailures * 2))
+                    if ((minusCount + plusCount) > (reportMaxFailures * 2))
                     {
-                        proxyStrings[index] = modString.TrimEnd('+', '-') + (good ? '+' : '-');
+                        proxyList[index] = modString.TrimEnd('+', '-') + postfix;
                     }
-                    else { proxyStrings[index] = modString; }
+                    else { proxyList[index] = modString; }
+                }
+                if (proxyList.Count < minProxCount)
+                {
+                    Task.Run(() => GetNewProxies());
                 }
             }
         }
 
+        /// <summary>
+        /// locks getNewProxiesLock
+        /// locks listLock
+        /// </summary>
+        void GetNewProxies()
+        {
+            lock (getNewProxiesLock)
+            {
+                lock (listLock)
+                {
+                    if (proxyList.Count >= minProxCount) { return; }
+                }
+                List<string> newProxies = new List<string>();
+                for (int i = 0; i < proxySites.Length; i++)
+                {
+                    newProxies.AddRange(GetProxyListFromNextSite());
+                    if (newProxies.Count > criticalProxCount) { break; }
+                }
+                if (newProxies.Count == 0) { throw new OutOfProxyException(); }
+                AddProxyRangeToList(newProxies);
+                SaveProxyListToFile();
+            }
+        }
 
+
+        List<string> GetProxyListFromNextSite()
+        {
+            var proxList = new List<string>();
+            try
+            {
+                if (proxySites.Length == 0) { return proxList; }
+                if (sitesCounter >= proxySites.Length) { sitesCounter = 0; }
+                string site = proxySites[sitesCounter];
+                sitesCounter++;
+                Log.Line($"[PM: Getting proxies from {site}] ");
+                var result = ProcessProxyURL(site, 5);
+                if (result == null || result.Item2 == null) { return proxList; }
+                proxList = ParseProxyPage(result.Item2);
+                int count = proxList.Count;
+                Log.Line($"[PM: Got {count} proxies] ");
+            }
+            catch { }
+            return proxList;
+        }
+
+        Tuple<string, string> ProcessProxyURL(string url, int retryCount)
+        {
+            for (int i = 0; i < retryCount; i++)
+            {
+                try
+                {
+                    HttpWebRequest request = (HttpWebRequest)WebRequest.Create(url);
+                    request.Credentials = CredentialCache.DefaultCredentials;
+                    request.Timeout = Timeout;
+                    request.ReadWriteTimeout = Timeout;
+                    request.KeepAlive = false;
+
+                    using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
+                    {
+                        if (response.StatusCode == HttpStatusCode.OK)
+                        {
+                            using (StreamReader reader = new StreamReader(response.GetResponseStream()))
+                            {
+                                string data = reader.ReadToEnd();
+                                reader.Close();
+                                response.Close();
+                                return Tuple.Create(url, data);
+                            }
+                        }
+                    }
+                }
+                catch { }
+            }
+            Log.Line($"Task failed after {retryCount} reties");
+            return null;
+        }
+
+        List<string> ParseProxyPage(string page)
+        {
+            //5.2.75.170:1080 :
+            const string addressPortRegEx =
+                @"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?):\d{1,5}\b";
+            //5.2.75.170</td><td>1080</td> :
+            const string tdProxyRegex =
+                @"\b((?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))</td><td>(\d{1,5})\b";
+            //<td>124.88.67.54</td><td><a href="/proxylist/port/81">81</a>:
+            const string ahrefProxyRegex =
+                @"\b((?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))</td><td><a.*?>(\d{1,5})\b";
+            const string gatherProxyRegex =
+                "PROXY_IP\":\"((?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))\",\"PROXY_LAST_UPDATE\":\"(?:[\\d\\s]+)\",\"PROXY_PORT\":\"([\\dA-F]{1,4})\\b";
+            const string proxynovaRegex =
+                @"((?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?))\s*(?:<.*?>\s*){1,3}(\d{1,5})";
+            List<string> proxList = new List<string>();
+            foreach (Match match in Regex.Matches(page, addressPortRegEx))
+            {
+                string matchedProx = match.Value;
+                if (!string.IsNullOrWhiteSpace(matchedProx))
+                {
+                    proxList.Add(matchedProx);
+                }
+            }
+            foreach (Match match in Regex.Matches(page, tdProxyRegex))
+            {
+                if (match.Groups.Count < 3) { continue; }
+                string address = match.Groups[1].Value;
+                string port = match.Groups[2].Value;
+                if (!string.IsNullOrWhiteSpace(address) && !string.IsNullOrWhiteSpace(port))
+                {
+                    proxList.Add(address + ":" + port);
+                }
+            }
+            foreach (Match match in Regex.Matches(page, ahrefProxyRegex))
+            {
+                if (match.Groups.Count < 3) { continue; }
+                string address = match.Groups[1].Value;
+                string port = match.Groups[2].Value;
+                if (!string.IsNullOrWhiteSpace(address) && !string.IsNullOrWhiteSpace(port))
+                {
+                    proxList.Add(address + ":" + port);
+                }
+            }
+            foreach (Match match in Regex.Matches(page, gatherProxyRegex))
+            {
+                if (match.Groups.Count < 3) { continue; }
+                string address = match.Groups[1].Value;
+                string hexPort = match.Groups[2].Value;
+                if (!string.IsNullOrWhiteSpace(address) && !string.IsNullOrWhiteSpace(hexPort))
+                {
+                    int port = Convert.ToInt32(hexPort, 16);
+                    proxList.Add(address + ":" + port);
+                }
+            }
+            string pageWithoutSpan = page.Replace("</span>", "").Replace("<span>", "");
+            foreach (Match match in Regex.Matches(pageWithoutSpan, proxynovaRegex))
+            {
+                if (match.Groups.Count < 3) { continue; }
+                string address = match.Groups[1].Value;
+                string port = match.Groups[2].Value;
+                if (!string.IsNullOrWhiteSpace(address) && !string.IsNullOrWhiteSpace(port))
+                {
+                    proxList.Add(address + ":" + port);
+                }
+            }
+            return proxList;
+        }
     }
+
+
+
+
     public class OutOfProxyException : Exception
     {
         public OutOfProxyException() { }
