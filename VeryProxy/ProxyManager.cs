@@ -114,7 +114,7 @@ namespace VeryProxy
                 if (listCounter >= count) { listCounter = 0; }
                 string proxyString = proxyList[listCounter].TrimEnd('+', '-', ' ');
                 listCounter++;
-                if (listCounter % saveEvery == 0) { Task.Run(() => SaveProxyListToFile()); }
+                if (listCounter % saveEvery == 0) { Task.Run(() => SaveProxyListToFile()); } //separate task to avoid deadlock
                 return proxyString;
             }
         }
@@ -125,16 +125,9 @@ namespace VeryProxy
             {
                 bool good = (mark > 0);
                 failuresInARow = good ? 0 : failuresInARow + 1;
-                if (failuresInARow >= maxFailuresInARow)
-                {
-                    Log.SameLine("F");
-                    return;
-                }
+                if (failuresInARow >= maxFailuresInARow) { Log.SameLine("F"); return; }
                 int index = proxyList.FindIndex(s => s.TrimEnd('+', '-', ' ') == proxyString);
-                if (index == -1)
-                {
-                    return;
-                }
+                if (index == -1) { return; }
                 string origString = proxyList[index];
                 string postfix = "";
                 for (int i = 0; i < Math.Abs(mark); i++)
@@ -149,7 +142,7 @@ namespace VeryProxy
                 {
                     Log.SameLine("X");
                     proxyList.RemoveAt(index);
-                    SaveProxyListToFile();
+                    Task.Run(() => SaveProxyListToFile());   //separate task to avoid deadlock
                 }
                 else
                 {
@@ -161,33 +154,40 @@ namespace VeryProxy
                 }
                 if (proxyList.Count < minProxCount)
                 {
-                    Task.Run(() => GetNewProxies());
+                    Task.Run(() => GetNewProxies());         //separate task to avoid deadlock
                 }
             }
         }
 
         /// <summary>
-        /// locks getNewProxiesLock
+        /// tries to enter getNewProxiesLock
         /// locks listLock
         /// </summary>
         void GetNewProxies()
         {
-            lock (getNewProxiesLock)
+            if (Monitor.TryEnter(getNewProxiesLock))
             {
-                lock (listLock)
+                try
                 {
-                    if (proxyList.Count >= minProxCount) { return; }
+                    lock (listLock)
+                    {
+                        if (proxyList.Count >= minProxCount) { return; }
+                    }
+                    List<string> newProxies = new List<string>();
+                    for (int i = 0; i < proxySites.Length; i++)
+                    {
+                        newProxies.AddRange(GetProxyListFromNextSite());
+                        if (newProxies.Count > criticalProxCount) { break; }
+                    }
+                    if (newProxies.Count == 0) { throw new OutOfProxyException(); }
+                    AddProxyRangeToList(newProxies);
+                    SaveProxyListToFile();
                 }
-                List<string> newProxies = new List<string>();
-                for (int i = 0; i < proxySites.Length; i++)
+                finally
                 {
-                    newProxies.AddRange(GetProxyListFromNextSite());
-                    if (newProxies.Count > criticalProxCount) { break; }
+                    Monitor.Exit(getNewProxiesLock);
                 }
-                if (newProxies.Count == 0) { throw new OutOfProxyException(); }
-                AddProxyRangeToList(newProxies);
-                SaveProxyListToFile();
-            }
+            }   
         }
 
 
@@ -202,8 +202,9 @@ namespace VeryProxy
                 sitesCounter++;
                 Log.Line($"[PM: Getting proxies from {site}] ");
                 var result = ProcessProxyURL(site, 5);
-                if (result == null || result.Item2 == null) { return proxList; }
-                proxList = ParseProxyPage(result.Item2);
+                Log.Line($"[PM: Got page content...] ");
+                if (string.IsNullOrWhiteSpace(result)) { Log.SameLine("[PM: content is empty] "); return proxList; }
+                proxList = ParseProxyPage(result);
                 int count = proxList.Count;
                 Log.Line($"[PM: Got {count} proxies] ");
             }
@@ -211,7 +212,7 @@ namespace VeryProxy
             return proxList;
         }
 
-        Tuple<string, string> ProcessProxyURL(string url, int retryCount)
+        string ProcessProxyURL(string url, int retryCount)
         {
             for (int i = 0; i < retryCount; i++)
             {
@@ -232,14 +233,14 @@ namespace VeryProxy
                                 string data = reader.ReadToEnd();
                                 reader.Close();
                                 response.Close();
-                                return Tuple.Create(url, data);
+                                return data;
                             }
                         }
                     }
                 }
                 catch { }
             }
-            Log.Line($"Task failed after {retryCount} reties");
+            Log.Line($"[PM: Task failed after {retryCount} reties] ");
             return null;
         }
 
